@@ -75,16 +75,21 @@ app.get('/me', authMiddleware, async (c) => {
  
 // GET /api/servers/:serverId - single server details
 app.get('/:serverId', authMiddleware, async (c) => {
-    const { serverId } = c.req.param()
- 
-    const server = await db.query.serverTable.findFirst({
-        where: eq(serverTable.serverId, serverId),
-    })
- 
-    if (!server) return c.json({ error: 'Server not found' }, 404)
- 
-    return c.json(server)
+    try {
+        const { serverId } = c.req.param()
+
+        const server = await db.query.serverTable.findFirst({
+            where: eq(serverTable.serverId, serverId),
+        })
+                
+        if (!server) return c.json({ error: 'Server not found' }, 404)
+        
+        return c.json(server)
+    } catch (error) {
+        return c.json({ error: 'Internal server error', details: error.message }, 500);
+    }
 })
+
 
 // GET /api/servers/:serverId/members - all members of a server
 app.get('/:serverId/members', authMiddleware, async (c) => {

@@ -11,18 +11,18 @@ import { signAccessToken, issueRefreshToken } from '@/lib/token'
 
 const app = new Hono()
 
+// Short-lived cookie used only during the OAuth handshake
 const COOKIE_OPTS = {
     path: '/',
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'Lax' as const,
-    maxAge: 60 * 15, // 15 min - only needed during the OAuth handshake
+    maxAge: 60 * 15,                // 15 min 
 }
 
 
-// GitHub
-
-// GET /api/auth/oauth/github - redirect to GitHub
+// GET /api/auth/oauth/github 
+// Redirect the browser to GitHub's authorization page
 app.get('/github', (c) => {
     const state = generateState()
 
@@ -33,12 +33,14 @@ app.get('/github', (c) => {
 })
 
 // GET /api/auth/oauth/github/callback
+// GitHub redirects back here with ?code=…&state=…
 app.get('/github/callback', async (c) => {
     const { code, state } = c.req.query()
     const storedState = getCookie(c, 'oauth_state')
 
+    // Validate the state parameter to prevent CSRF
     if (!code || !state || !storedState || state !== storedState)
-        return c.json({ error: 'Invalid OAuth state' }, 400)
+        return c.json({ error: 'Invalid or expired OAuth state. Please try signing in again.' }, 400)
 
     deleteCookie(c, 'oauth_state', { path: '/' })
 
@@ -46,11 +48,12 @@ app.get('/github/callback', async (c) => {
 
     try {
         tokens = await github.validateAuthorizationCode(code)
-    } catch {
-        return c.json({ error: 'Failed to exchange code for token' }, 400)
+    } catch (err) {
+        console.error('[OAuth/GitHub] code exchange failed:', err)
+        return c.json({ error: 'Failed to exchange authorization code. Please try again.' }, 400)
     }
 
-    // Fetch GitHub user profile
+    // Fetch the authenticated user's profile
     const profileRes = await fetch('https://api.github.com/user', {
         headers: {
             Authorization: `Bearer ${tokens.accessToken()}`,
@@ -58,7 +61,11 @@ app.get('/github/callback', async (c) => {
         },
     })
 
-    if (!profileRes.ok) return c.json({ error: 'Failed to fetch GitHub profile' }, 502)
+    if (!profileRes.ok) {
+        console.error('[OAuth/GitHub] profile fetch failed:', profileRes.status)
+        return c.json({ error: 'Failed to fetch GitHub profile. Please try again.' }, 502)
+    }
+
 
     const profile = await profileRes.json() as {
         id: number
@@ -78,6 +85,7 @@ app.get('/github/callback', async (c) => {
                 'User-Agent': 'Disq-App',
             },
         })
+
         if (emailsRes.ok) {
             const emails = await emailsRes.json() as Array<{
                 email: string
@@ -85,6 +93,8 @@ app.get('/github/callback', async (c) => {
                 verified: boolean
             }>
             primaryEmail = emails.find(e => e.primary && e.verified)?.email ?? null
+        } else {
+            console.warn('[OAuth/GitHub] email fetch failed:', emailsRes.status)
         }
     }
 
@@ -101,7 +111,8 @@ app.get('/github/callback', async (c) => {
 
 // Google
 
-// GET /api/auth/oauth/google - redirect to Google
+// GET /api/auth/oauth/google
+// Redirect the browser to Google's authorization page
 app.get('/google', (c) => {
     const state = generateState()
     const codeVerifier = generateCodeVerifier()
@@ -114,13 +125,15 @@ app.get('/google', (c) => {
 })
 
 // GET /api/auth/oauth/google/callback
+// Google redirects back here with ?code=…&state=…
 app.get('/google/callback', async (c) => {
     const { code, state } = c.req.query()
     const storedState = getCookie(c, 'oauth_state')
     const storedCodeVerifier = getCookie(c, 'oauth_code_verifier')
 
+    // Validate state (CSRF) and ensure the PKCE verifier is present
     if (!code || !state || !storedState || state !== storedState || !storedCodeVerifier)
-        return c.json({ error: 'Invalid OAuth state' }, 400)
+        return c.json({ error: 'Invalid or expired OAuth state. Please try signing in again.' }, 400)
 
     deleteCookie(c, 'oauth_state', { path: '/' })
     deleteCookie(c, 'oauth_code_verifier', { path: '/' })
@@ -128,25 +141,33 @@ app.get('/google/callback', async (c) => {
     let tokens: Awaited<ReturnType<typeof google.validateAuthorizationCode>>
     try {
         tokens = await google.validateAuthorizationCode(code, storedCodeVerifier)
-    } catch {
-        return c.json({ error: 'Failed to exchange code for token' }, 400)
+    } catch (err) {
+        console.error('[OAuth/Google] code exchange failed:', err)
+        return c.json({ error: 'Failed to exchange authorization code. Please try again.' }, 400)
     }
 
-    // Decode the ID token - avoids an extra /userinfo round-trip
-    const idToken = tokens.idToken()
-    const payload = JSON.parse(atob(idToken.split('.')[1])) as {
+    // Decode the signed ID token instead of making an extra /userinfo request
+   let payload: {
         sub: string
         email: string
         email_verified: boolean
         name: string
         picture: string
     }
-
+ 
+    try {
+        const idToken = tokens.idToken()
+        payload = JSON.parse(atob(idToken.split('.')[1]))
+    } catch (err) {
+        console.error('[OAuth/Google] ID token decode failed:', err)
+        return c.json({ error: 'Failed to read identity token. Please try again.' }, 400)
+    }
+ 
     return handleOAuthSignIn(c, {
         provider: 'google',
         providerUserId: payload.sub,
         email: payload.email,
-        username: null,           // derived from email below
+        username: null,               // derived from email in deriveUsername()
         displayName: payload.name,
         avatarUrl: payload.picture,
     })
@@ -166,7 +187,7 @@ type OAuthProfile = {
 
 async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
     try {
-        // Returning user - oauth_account row already exists
+        // Check if this provider account has signed in before
         const existingOAuth = await db.query.oauthAccountsTable.findFirst({
             where: and(
                 eq(oauthAccountsTable.provider, profile.provider),
@@ -177,10 +198,11 @@ async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
         let userId: string
 
         if (existingOAuth) {
+            // Returning user reuse the linked account
             userId = existingOAuth.userId
         } else {
-            // Find existing user by email, or create a fresh one
-            const existingUser = profile.email
+                // New OAuth connection find an existing user by email or create one            
+                const existingUser = profile.email
                 ? await db.query.usersTable.findFirst({
                     where: eq(usersTable.email, profile.email),
                   })
@@ -190,13 +212,14 @@ async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
                 // Link new provider to the existing account
                 userId = existingUser.id
             } else {
-                // Brand-new user
+                // Brand-new user - generate a username and insert the row
                 const uniqueUsername = await ensureUniqueUsername(deriveUsername(profile))
 
                 const [newUser] = await db
                     .insert(usersTable)
                     .values({
                         username: uniqueUsername,
+                        // Fallback email keeps the column non-null for OAuth-only accounts
                         email: profile.email ?? `${uniqueUsername}@oauth.local`,
                         displayName: profile.displayName,
                         image: profile.avatarUrl,
@@ -206,7 +229,7 @@ async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
                 userId = newUser.id
             }
 
-            // Always create the oauth_account link for new connections
+            // Record the provider link so future logins skip user lookup
             await db.insert(oauthAccountsTable).values({
                 userId,
                 provider: profile.provider,
@@ -218,8 +241,8 @@ async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
         const accessToken = await signAccessToken(userId)
         const refreshToken = await issueRefreshToken(userId)
 
-        // Pass tokens to SvelteKit via query params - the /auth/callback page
-        // reads them, sets httpOnly cookies, then redirects to /servers/@me
+        // Hand the tokens to SvelteKit via query params.
+        // The /auth/callback page stores them in httpOnly cookies and redirects to /servers/@me.
         const frontendUrl = process.env.FRONTEND_URL!
         const callbackUrl = new URL('/auth/callback', frontendUrl)
         callbackUrl.searchParams.set('accessToken',  accessToken)
@@ -236,30 +259,37 @@ async function handleOAuthSignIn(c: Context, profile: OAuthProfile) {
 
 // Helpers
 
+// Pick the best available field to base the username on
 function deriveUsername(profile: OAuthProfile): string {
     if (profile.username) return sanitizeUsername(profile.username)
     if (profile.email) return sanitizeUsername(profile.email.split('@')[0])
     return sanitizeUsername(profile.displayName)
 }
 
+// Ensure the username contains only lowercase letters, digits, and underscores
 function sanitizeUsername(raw: string): string {
     return raw
         .toLowerCase()
-        .replace(/[^a-z0-9_]/g, '_')
-        .replace(/__+/g, '_')
-        .replace(/^_+|_+$/g, '')     // trim leading/trailing underscores
-        .slice(0, 30)
+        .replace(/[^a-z0-9_]/g, '_')   // replace disallowed chars with _
+        .replace(/__+/g, '_')           // collapse consecutive underscores
+        .replace(/^_+|_+$/g, '')        // strip leading / trailing underscores
+        .slice(0, 30)                   // enforce max length
 }
 
+// Keep retrying with a random suffix until we find a name that isn't taken
 async function ensureUniqueUsername(base: string): Promise<string> {
     let candidate = base
-    for (let i = 0; i < 10; i++) {
+ 
+    for (let attempt = 0; attempt < 10; attempt++) {
         const taken = await db.query.usersTable.findFirst({
             where: eq(usersTable.username, candidate),
         })
+ 
         if (!taken) return candidate
+ 
         candidate = `${base}_${Math.random().toString(36).slice(2, 6)}`
     }
+ 
     throw new Error('Could not generate a unique username after 10 attempts')
 }
 

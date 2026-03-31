@@ -3,94 +3,96 @@ import { eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { refreshTokensTable } from '@/db/schema'
 
-
-const ACCESS_TOKEN_TTL = 60 * 30            // 30 minutes
-const REFRESH_TOKEN_TTL = 60 * 60 * 24 * 7  // 7 days
-
+const ACCESS_TOKEN_TTL  = 60 * 30              // 30 minutes
+const REFRESH_TOKEN_TTL = 60 * 60 * 24 * 7    // 7 days
 
 export type AccessTokenPayload = {
-    sub: string              // claim via userId
+    sub:  string     // user ID
     type: 'access'
-    iat: number
-    exp: number
+    iat:  number
+    exp:  number
 }
 
-
-// Sign a short-lived access token
-export async function signAccessToken(userId: string) {    
+// Create a short-lived JWT that authorizes API requests
+export async function signAccessToken(userId: string): Promise<string> {
     const issuedAt  = Math.floor(Date.now() / 1000)
     const expiresAt = issuedAt + ACCESS_TOKEN_TTL
 
     return sign(
         {
-            sub: userId,
+            sub:  userId,
             type: 'access',
-            iat: issuedAt,
-            exp: expiresAt
+            iat:  issuedAt,
+            exp:  expiresAt,
         } satisfies AccessTokenPayload,
         process.env.JWT_SECRET!,
-        'HS256'
+        'HS256',
     )
 }
 
-// Issue + persist a refresh token
-export async function issueRefreshToken(userId: string) {
-    
-    // Raw token = random UUID (not a JWT)
-    const rawToken = crypto.randomUUID()
+// Generate a random refresh token, hash it, and persist the hash
+// The raw (unhashed) token is returned to the caller — never store the raw value
+export async function issueRefreshToken(userId: string): Promise<string> {
+    const rawToken  = crypto.randomUUID()
     const tokenHash = await hashToken(rawToken)
     const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL * 1000)
 
-    await db
-        .insert(refreshTokensTable)
-        .values({ userId, tokenHash, expiresAt })
+    await db.insert(refreshTokensTable).values({ userId, tokenHash, expiresAt })
 
-    return rawToken  // send this to the client, don't store raw value
+    return rawToken
 }
 
-// Rotate: validate old refresh token, issue new one
-export async function rotateRefreshToken(rawToken: string) {
-    const hashedToken = await hashToken(rawToken)
+// Validate a refresh token, delete it (preventing reuse), and issue a new one
+// Throws a descriptive error when the token is missing or expired
+export async function rotateRefreshToken(
+    rawToken: string,
+): Promise<{ userId: string; newRefreshToken: string }> {
+    const tokenHash   = await hashToken(rawToken)
 
     const storedToken = await db.query.refreshTokensTable.findFirst({
-        where: eq(refreshTokensTable.tokenHash, hashedToken),
+        where: eq(refreshTokensTable.tokenHash, tokenHash),
     })
 
-    if (!storedToken) throw new Error('Invalid refresh token')
-    
+    if (!storedToken)
+        throw new Error('Refresh token not found. Please sign in again.')
+
     if (storedToken.expiresAt < new Date()) {
-        // Clean up expired token
+        // Clean up the expired row before rejecting
         await db
             .delete(refreshTokensTable)
             .where(eq(refreshTokensTable.id, storedToken.id))
 
-        throw new Error('Refresh token expired')
+        throw new Error('Refresh token has expired. Please sign in again.')
     }
 
-    // Rotate: delete old, issue new (prevents reuse)
+    // Delete the used token (rotation prevents replay attacks)
     await db
         .delete(refreshTokensTable)
         .where(eq(refreshTokensTable.id, storedToken.id))
-   
+
     const newRawToken = await issueRefreshToken(storedToken.userId)
 
     return { userId: storedToken.userId, newRefreshToken: newRawToken }
 }
 
-// Revoke a specific refresh token (logout)
-export async function revokeRefreshToken(rawToken: string) {
+// Invalidate a specific refresh token (used during logout)
+export async function revokeRefreshToken(rawToken: string): Promise<void> {
     const tokenHash = await hashToken(rawToken)
+
     await db
         .delete(refreshTokensTable)
         .where(eq(refreshTokensTable.tokenHash, tokenHash))
 }
 
+// Produce a hex-encoded SHA-256 digest using the Web Crypto API
+async function hashToken(rawToken: string): Promise<string> {
+    const buffer = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(rawToken),
+    )
 
-// SHA-256 hash using Web Crypto
-async function hashToken(rawToken: string) {
-    const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawToken))
-    
     return Array
         .from(new Uint8Array(buffer))
-        .map(b => b.toString(16).padStart(2, '0')).join('')
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')
 }
